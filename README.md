@@ -139,4 +139,4 @@ This plugin is licensed under the GPL v2 or later.
 
 ## Credits
 
-Developed by Your Name/Company.
+Developed by Kevin Ng
