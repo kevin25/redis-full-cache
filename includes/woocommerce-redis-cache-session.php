@@ -3,6 +3,7 @@
  * WooCommerce Redis Session Handler
  *
  * Handles storing WooCommerce session data in Redis
+ * Compatible with WooCommerce 10.x
  *
  * @package WC_Redis_Cache
  */
@@ -48,14 +49,14 @@ class WC_Redis_Cache_Session {
      * @return string Class name
      */
     public function register_session_handler() {
-        // Include custom session handler
-        include_once WC_REDIS_CACHE_PATH . 'includes/class-wc-session-handler-redis.php';
         return 'WC_Session_Handler_Redis';
     }
 }
 
 /**
  * Redis-based WooCommerce session handler
+ * 
+ * FIXED for WooCommerce 10.x compatibility
  */
 class WC_Session_Handler_Redis extends WC_Session_Handler {
 
@@ -74,19 +75,26 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
     protected $ttl;
 
     /**
+     * Plugin instance
+     *
+     * @var WC_Redis_Cache
+     */
+    protected $plugin;
+
+    /**
      * Constructor
      */
     public function __construct() {
         parent::__construct();
         
         // Get plugin instance
-        $plugin = WC_Redis_Cache();
+        $this->plugin = WC_Redis_Cache();
         
         // Store Redis connection
-        $this->redis = $plugin->get_redis();
+        $this->redis = $this->plugin->get_redis();
         
         // Get session TTL
-        $this->ttl = $plugin->get_ttl('session');
+        $this->ttl = $this->plugin->get_ttl('session');
         
         // Set cookie if it doesn't exist already
         if ($this->redis && !$this->has_session()) {
@@ -95,7 +103,7 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
     }
 
     /**
-     * Get session data
+     * Get session data from Redis
      *
      * @return array
      */
@@ -105,12 +113,25 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
         }
 
         $cache_key = $this->get_cache_key();
-        $value = $this->redis->get($cache_key);
         
-        if (!empty($value)) {
-            $this->_data = maybe_unserialize($value);
-            // Extend session expiration
-            $this->redis->expire($cache_key, $this->ttl);
+        try {
+            $value = $this->redis->get($cache_key);
+            
+            if (!empty($value)) {
+                $data = maybe_unserialize($value);
+                
+                if (is_array($data)) {
+                    $this->_data = $data;
+                    
+                    // Extend session expiration
+                    $this->redis->expire($cache_key, $this->ttl);
+                    
+                    $this->plugin->log("Session loaded: {$this->_customer_id}");
+                }
+            }
+        } catch (Exception $e) {
+            $this->plugin->log("Session get error: " . $e->getMessage());
+            return parent::get_session_data();
         }
         
         return $this->has_session() ? (array) $this->_data : [];
@@ -127,14 +148,23 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
 
         // Only update if data has changed
         if ($this->_dirty && $this->has_session()) {
-            $cache_key = $this->get_cache_key();
-            $value = maybe_serialize($this->_data);
-            
-            // Save to Redis with TTL
-            $this->redis->setex($cache_key, $this->ttl, $value);
-            
-            // Mark as clean after saving
-            $this->_dirty = false;
+            try {
+                $cache_key = $this->get_cache_key();
+                $value = maybe_serialize($this->_data);
+                
+                // Save to Redis with TTL
+                $result = $this->redis->setex($cache_key, $this->ttl, $value);
+                
+                if ($result) {
+                    // Mark as clean after saving
+                    $this->_dirty = false;
+                    $this->plugin->log("Session saved: {$this->_customer_id}");
+                }
+            } catch (Exception $e) {
+                $this->plugin->log("Session save error: " . $e->getMessage());
+                // Fallback to parent implementation
+                parent::save_data();
+            }
         }
     }
 
@@ -147,21 +177,23 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
             return;
         }
 
-        $cache_key = $this->get_cache_key();
-        $this->redis->del($cache_key);
+        try {
+            $cache_key = $this->get_cache_key();
+            $this->redis->del($cache_key);
+            
+            $this->plugin->log("Session destroyed: {$this->_customer_id}");
+        } catch (Exception $e) {
+            $this->plugin->log("Session destroy error: " . $e->getMessage());
+        }
         
-        // Reset cookie and customer ID
-        $this->_customer_id = null;
-        $this->_data = [];
-        $this->_dirty = false;
-        $this->cookie_deletion_time = time() - YEAR_IN_SECONDS;
-        
-        // Clear cookies
-        wc_setcookie('wp_woocommerce_session_' . COOKIEHASH, '', $this->cookie_deletion_time, $this->use_secure_cookie, true);
+        // Call parent to handle WordPress session cleanup
+        parent::destroy_session();
     }
     
     /**
-     * Update session if its close to expiring
+     * Update session timestamp if close to expiring
+     * 
+     * This prevents active sessions from expiring
      */
     public function update_session_timestamp() {
         if (!$this->redis || !$this->_customer_id) {
@@ -169,15 +201,33 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
             return;
         }
         
-        $cache_key = $this->get_cache_key();
-        
-        // Get the remaining TTL
-        $ttl = $this->redis->ttl($cache_key);
-        
-        // If TTL is less than half the session lifetime, update it
-        if ($ttl > 0 && $ttl < ($this->ttl / 2)) {
-            $this->redis->expire($cache_key, $this->ttl);
+        try {
+            $cache_key = $this->get_cache_key();
+            
+            // Get the remaining TTL
+            $ttl = $this->redis->ttl($cache_key);
+            
+            // If TTL is less than half the session lifetime, update it
+            if ($ttl > 0 && $ttl < ($this->ttl / 2)) {
+                $this->redis->expire($cache_key, $this->ttl);
+                $this->plugin->log("Session TTL extended: {$this->_customer_id}");
+            }
+        } catch (Exception $e) {
+            $this->plugin->log("Session timestamp update error: " . $e->getMessage());
+            parent::update_session_timestamp();
         }
+    }
+    
+    /**
+     * Cleanup expired sessions
+     * 
+     * This is called by WooCommerce's session cleanup cron
+     * With Redis, we don't need to do anything as TTL handles cleanup
+     */
+    public function cleanup_sessions() {
+        // Redis handles cleanup automatically via TTL
+        // No action needed
+        $this->plugin->log("Session cleanup called (handled by Redis TTL)");
     }
     
     /**
@@ -187,5 +237,46 @@ class WC_Session_Handler_Redis extends WC_Session_Handler {
      */
     protected function get_cache_key() {
         $blog_id = get_current_blog_id();
-        return "wc:{$blog_id}:session:{$this->_customer_id}";
+        return "wc:v" . explode('.', WC_VERSION)[0] . ":{$blog_id}:session:{$this->_customer_id}";
     }
+    
+    /**
+     * Check if session exists in Redis
+     * 
+     * @return bool
+     */
+    public function session_exists() {
+        if (!$this->redis || !$this->_customer_id) {
+            return false;
+        }
+        
+        try {
+            $cache_key = $this->get_cache_key();
+            return $this->redis->exists($cache_key) > 0;
+        } catch (Exception $e) {
+            $this->plugin->log("Session exists check error: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Get session expiry time
+     * 
+     * @return int|false Time remaining in seconds, or false if no session
+     */
+    public function get_session_expiry() {
+        if (!$this->redis || !$this->_customer_id) {
+            return false;
+        }
+        
+        try {
+            $cache_key = $this->get_cache_key();
+            $ttl = $this->redis->ttl($cache_key);
+            
+            return $ttl > 0 ? $ttl : false;
+        } catch (Exception $e) {
+            $this->plugin->log("Session expiry check error: " . $e->getMessage());
+            return false;
+        }
+    }
+}
